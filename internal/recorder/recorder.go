@@ -117,14 +117,29 @@ func (r *Recorder) MonitorChannel(ctx context.Context) error {
 func (r *Recorder) checkAndRecord(ctx context.Context) error {
 	m3u8URL, err := r.twitchClient.GetLiveM3U8(ctx, r.channel)
 	if err != nil {
+		if errors.Is(err, twitch.ErrTokenFetchFailed) {
+			log.DebugfC(r.channel, "Token fetch failed temporarily: %v", err)
+			return nil
+		}
+
 		if errors.Is(err, twitch.ErrInvalidUser) {
+			if !r.twitchClient.IsChannelValidated(r.channel) && r.twitchClient.ValidateUserWithHelix(ctx, r.channel) {
+				log.InfofC(r.channel, "User validated via Helix API, continuing monitor")
+				r.twitchClient.MarkChannelValidated(r.channel)
+				r.mu.Lock()
+				r.failureCount = 0
+				r.mu.Unlock()
+				return nil
+			}
+
 			r.mu.Lock()
 			r.failureCount++
 			count := r.failureCount
 			r.mu.Unlock()
 
 			if count >= r.maxFailures {
-				log.ErrorfC(r.channel, "User may be invalid (failed %d times), stopping monitor", count)
+				log.ErrorfC(r.channel, "User is invalid (failed %d times), stopping monitor", count)
+				r.twitchClient.RemoveValidatedChannel(r.channel)
 				return ErrInvalidUser
 			}
 

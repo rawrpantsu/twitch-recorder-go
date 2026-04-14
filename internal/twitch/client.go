@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"math/rand"
 	"net/url"
+	"os"
 	"strconv"
 	"strings"
 	"sync"
@@ -30,23 +31,28 @@ const (
 )
 
 var (
-	ErrUserNotFound   = errors.New("user not found")
-	ErrStreamNotFound = errors.New("stream not found")
+	ErrUserNotFound     = errors.New("user not found")
+	ErrStreamNotFound   = errors.New("stream not found")
+	ErrTokenFetchFailed = errors.New("failed to fetch playback token")
+	ErrInvalidUser      = errors.New("user is invalid or does not exist")
 )
 
 type Client struct {
-	httpClient        *resty.Client
-	clientID          string
-	clientSecret      string
-	oauthKey          string
-	accessToken       string
-	expiresAt         time.Time
-	mu                sync.RWMutex
-	isRefreshingToken bool
-	rateLimiter       *ratelimit.Limiter
-	metrics           *metrics.Metrics
-	tokenCache        map[string]*CachedToken
-	tokenCacheMu      sync.RWMutex
+	httpClient          *resty.Client
+	clientID            string
+	clientSecret        string
+	oauthKey            string
+	accessToken         string
+	expiresAt           time.Time
+	mu                  sync.RWMutex
+	isRefreshingToken   bool
+	rateLimiter         *ratelimit.Limiter
+	metrics             *metrics.Metrics
+	tokenCache          map[string]*CachedToken
+	tokenCacheMu        sync.RWMutex
+	validatedChannels   map[string]bool
+	validatedChannelsMu sync.RWMutex
+	validatedFilePath   string
 }
 
 func NewClient(clientID, clientSecret, oauthKey string, httpClient *resty.Client) *Client {
@@ -55,12 +61,14 @@ func NewClient(clientID, clientSecret, oauthKey string, httpClient *resty.Client
 
 func NewClientWithRateLimit(clientID, clientSecret, oauthKey string, httpClient *resty.Client, maxTokens int, refillRate time.Duration) *Client {
 	return &Client{
-		httpClient:   httpClient,
-		clientID:     clientID,
-		clientSecret: clientSecret,
-		oauthKey:     oauthKey,
-		rateLimiter:  ratelimit.NewLimiter(maxTokens, refillRate),
-		tokenCache:   make(map[string]*CachedToken),
+		httpClient:        httpClient,
+		clientID:          clientID,
+		clientSecret:      clientSecret,
+		oauthKey:          oauthKey,
+		rateLimiter:       ratelimit.NewLimiter(maxTokens, refillRate),
+		tokenCache:        make(map[string]*CachedToken),
+		validatedChannels: make(map[string]bool),
+		validatedFilePath: "",
 	}
 }
 
@@ -253,6 +261,116 @@ func (c *Client) getAccessToken() string {
 	return c.accessToken
 }
 
+func (c *Client) SetValidatedChannelsPath(path string) {
+	c.validatedFilePath = path
+	if path != "" {
+		_ = c.LoadValidatedChannels()
+	}
+}
+
+func (c *Client) LoadValidatedChannels() error {
+	if c.validatedFilePath == "" {
+		return nil
+	}
+
+	data, err := os.ReadFile(c.validatedFilePath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return err
+	}
+
+	var file struct {
+		Channels map[string]string `json:"channels"`
+	}
+
+	if err := json.Unmarshal(data, &file); err != nil {
+		return err
+	}
+
+	c.validatedChannelsMu.Lock()
+	for channel := range file.Channels {
+		c.validatedChannels[channel] = true
+	}
+	c.validatedChannelsMu.Unlock()
+
+	log.Infof("Loaded %d validated channels from %s", len(file.Channels), c.validatedFilePath)
+	return nil
+}
+
+func (c *Client) SaveValidatedChannels() error {
+	if c.validatedFilePath == "" {
+		return nil
+	}
+
+	c.validatedChannelsMu.RLock()
+	defer c.validatedChannelsMu.RUnlock()
+
+	return c.saveValidatedChannelsLocked()
+}
+
+func (c *Client) saveValidatedChannelsLocked() error {
+	file := struct {
+		Channels map[string]string `json:"channels"`
+	}{
+		Channels: make(map[string]string),
+	}
+
+	for channel := range c.validatedChannels {
+		file.Channels[channel] = time.Now().UTC().Format(time.RFC3339)
+	}
+
+	data, err := json.MarshalIndent(file, "", "  ")
+	if err != nil {
+		return err
+	}
+
+	return os.WriteFile(c.validatedFilePath, data, 0644)
+}
+
+func (c *Client) MarkChannelValidated(channel string) {
+	c.validatedChannelsMu.Lock()
+	defer c.validatedChannelsMu.Unlock()
+
+	if !c.validatedChannels[channel] {
+		c.validatedChannels[channel] = true
+		_ = c.saveValidatedChannelsLocked()
+	}
+}
+
+func (c *Client) IsChannelValidated(channel string) bool {
+	c.validatedChannelsMu.RLock()
+	defer c.validatedChannelsMu.RUnlock()
+	return c.validatedChannels[channel]
+}
+
+func (c *Client) RemoveValidatedChannel(channel string) {
+	c.validatedChannelsMu.Lock()
+	defer c.validatedChannelsMu.Unlock()
+
+	delete(c.validatedChannels, channel)
+	_ = c.saveValidatedChannelsLocked()
+}
+
+func (c *Client) CleanupStaleChannels(activeChannels []string) {
+	c.validatedChannelsMu.Lock()
+	defer c.validatedChannelsMu.Unlock()
+
+	activeSet := make(map[string]bool)
+	for _, ch := range activeChannels {
+		activeSet[ch] = true
+	}
+
+	for channel := range c.validatedChannels {
+		if !activeSet[channel] {
+			delete(c.validatedChannels, channel)
+		}
+	}
+
+	_ = c.saveValidatedChannelsLocked()
+}
+
 type APIError struct {
 	StatusCode int
 	Body       string
@@ -304,11 +422,11 @@ func (c *Client) GetLiveTokenSig(ctx context.Context, channel string) (*TokenSig
 		return nil, err
 	}
 
-	if resp.IsError() {
+	if resp.StatusCode() >= 400 {
 		if c.metrics != nil {
 			c.metrics.RecordGQLCall(false)
 		}
-		return nil, &APIError{StatusCode: resp.StatusCode(), Body: string(resp.Body())}
+		return nil, ErrTokenFetchFailed
 	}
 
 	if c.metrics != nil {
@@ -327,8 +445,6 @@ func (c *Client) GetLiveTokenSig(ctx context.Context, channel string) (*TokenSig
 	return &response, nil
 }
 
-var ErrInvalidUser = errors.New("user is invalid or does not exist")
-
 func (c *Client) GetCachedToken(ctx context.Context, channel string) (*CachedToken, error) {
 	c.tokenCacheMu.Lock()
 	cached, ok := c.tokenCache[channel]
@@ -342,6 +458,10 @@ func (c *Client) GetCachedToken(ctx context.Context, channel string) (*CachedTok
 	log.Infof("Fetching new token for channel %s", channel)
 	tokenSig, err := c.GetLiveTokenSig(ctx, channel)
 	if err != nil {
+		if errors.Is(err, ErrInvalidUser) && c.IsChannelValidated(channel) {
+			log.WarnfC(channel, "Token fetch failed for previously validated channel, treating as transient error")
+			return nil, ErrTokenFetchFailed
+		}
 		return nil, err
 	}
 
@@ -356,6 +476,8 @@ func (c *Client) GetCachedToken(ctx context.Context, channel string) (*CachedTok
 		Signature: tokenSig.Data.StreamPlaybackAccessToken.Signature,
 		ExpiresAt: expiresAt,
 	}
+
+	c.MarkChannelValidated(channel)
 
 	c.tokenCacheMu.Lock()
 	c.tokenCache[channel] = cachedToken
@@ -381,6 +503,22 @@ func extractTokenExpiration(tokenValue string) (time.Time, error) {
 	}
 
 	return time.Unix(int64(expires), 0).UTC(), nil
+}
+
+func (c *Client) ValidateUserWithHelix(ctx context.Context, channel string) bool {
+	if err := c.ensureAccessToken(ctx); err != nil {
+		log.Debugf("ValidateUserWithHelix: failed to get access token for %s: %v", channel, err)
+		return false
+	}
+
+	user, err := c.GetUser(ctx, channel)
+	if err != nil {
+		log.Debugf("ValidateUserWithHelix: user lookup failed for %s: %v", channel, err)
+		return false
+	}
+
+	log.Infof("Validated channel %s via Helix API (user_id: %s)", channel, user.ID)
+	return true
 }
 
 func (c *Client) GetLiveM3U8(ctx context.Context, channel string) (string, error) {

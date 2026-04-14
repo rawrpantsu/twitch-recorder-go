@@ -89,6 +89,7 @@ func main() {
 
 	twitchClient := createTwitchClient(c)
 	twitchClient.SetMetrics(m)
+	twitchClient.CleanupStaleChannels(c.Channels)
 
 	if testChatLogs != "" {
 		parts := strings.SplitN(testChatLogs, ":", 2)
@@ -262,7 +263,12 @@ func createTwitchClient(c *config.Config) *twitch.Client {
 		clientSecret = config.GetTwitchClientSecret()
 	}
 
-	return twitch.NewClientWithRateLimit(clientID, clientSecret, c.Twitch.OAuthKey, httpClient, c.Twitch.RateLimitMaxTokens, c.Twitch.RateLimitRefillMs)
+	client := twitch.NewClientWithRateLimit(clientID, clientSecret, c.Twitch.OAuthKey, httpClient, c.Twitch.RateLimitMaxTokens, c.Twitch.RateLimitRefillMs)
+
+	validatedPath := filepath.Join(filepath.Dir(cfgPath), "validated_channels.json")
+	client.SetValidatedChannelsPath(validatedPath)
+
+	return client
 }
 
 func overrideWithEnv(cfgVal, envVal string) string {
