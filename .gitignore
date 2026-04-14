@@ -1,4 +1,5 @@
 config.json
 twitch-recorder-go*
 twitch-recorder*
+validated_channels.json
 *opencode
