@@ -54,7 +54,8 @@ func TestDownloadQueuedSegmentsCancellation(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 
-	sd.DownloadQueuedSegments(ctx, 4)
+	sd.StartWorkers(ctx, 4)
+	time.Sleep(50 * time.Millisecond)
 }
 
 func TestDownloadQueuedSegmentsEmpty(t *testing.T) {
@@ -65,7 +66,8 @@ func TestDownloadQueuedSegmentsEmpty(t *testing.T) {
 	sd := NewSegmentDownloader(tempDir, "test", time.Now())
 
 	ctx := context.Background()
-	sd.DownloadQueuedSegments(ctx, 4)
+	sd.StartWorkers(ctx, 4)
+	time.Sleep(50 * time.Millisecond)
 }
 
 func TestPlaylistParserStructure(t *testing.T) {

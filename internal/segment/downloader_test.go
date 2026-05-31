@@ -25,7 +25,7 @@ func TestNewSegmentDownloader(t *testing.T) {
 	assert.Contains(t, sd.sessionDir, "testchannel")
 	assert.Contains(t, sd.sessionDir, "2026-03-19_14-30-00")
 	assert.NotNil(t, sd.seen)
-	assert.NotNil(t, sd.segments)
+	assert.NotNil(t, sd.segmentChan)
 }
 
 func TestAddSegment(t *testing.T) {
@@ -42,7 +42,7 @@ func TestAddSegment(t *testing.T) {
 	assert.True(t, added1)
 	assert.True(t, added2)
 	assert.False(t, added3)
-	assert.Len(t, sd.segments, 2)
+	assert.Len(t, sd.segmentChan, 2)
 }
 
 func TestAddSegmentConcurrency(t *testing.T) {
@@ -69,7 +69,7 @@ func TestAddSegmentConcurrency(t *testing.T) {
 	}
 
 	wg.Wait()
-	assert.Len(t, sd.segments, 100)
+	assert.Len(t, sd.segmentChan, 100)
 }
 
 func TestGetSegmentFilename(t *testing.T) {
@@ -147,7 +147,7 @@ func TestDownloadSegmentMaxRetries(t *testing.T) {
 	err = sd.DownloadSegment(context.Background(), server.URL)
 
 	assert.Error(t, err)
-	assert.Contains(t, err.Error(), "attempt 5/5")
+	assert.Contains(t, err.Error(), "attempt 20/20")
 }
 
 func TestDownloadSegmentCancel(t *testing.T) {

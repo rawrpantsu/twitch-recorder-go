@@ -172,6 +172,8 @@ func (r *Recorder) recordStream(ctx context.Context, m3u8URL string) error {
 		r.metrics.RecordRecordingStart()
 	}
 
+	downloader.StartWorkers(ctx, DownloadConcurrency)
+
 	streamIDCtx, streamIDCancel := context.WithTimeout(ctx, StreamCheckTimeout)
 	defer streamIDCancel()
 
@@ -252,7 +254,7 @@ func (r *Recorder) recordStream(ctx context.Context, m3u8URL string) error {
 			}
 		}
 
-		downloader.DownloadQueuedSegments(ctx, DownloadConcurrency)
+		
 
 		lastSeq := downloader.GetLastDownloadedSeq()
 		if lastSeq > 0 {

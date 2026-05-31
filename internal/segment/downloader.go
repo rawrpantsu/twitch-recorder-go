@@ -30,21 +30,21 @@ type SessionMetadata struct {
 
 const (
 	MetadataFileName   = "current_session.json"
-	MaxDownloadRetries = 5
-	DownloadTimeout    = 60 * time.Second
-	SegmentReadTimeout = 30 * time.Second
+	MaxDownloadRetries = 20
+	DownloadTimeout    = 15 * time.Second
 )
 
 type SegmentInfo struct {
-	URL    string
-	SeqNum int
+	URL          string
+	SeqNum       int
+	RequeueCount int // Track batch-level failures
 }
 
 type SegmentDownloader struct {
 	sessionDir        string
 	channel           string
 	seen              map[string]bool
-	segments          []SegmentInfo
+	segmentChan       chan SegmentInfo
 	mu                sync.Mutex
 	downloaded        int
 	totalSize         int64
@@ -66,18 +66,18 @@ func NewSegmentDownloader(vodDirectory, channel string, timestamp time.Time) *Se
 	}
 
 	return &SegmentDownloader{
-		sessionDir: sessionDir,
-		channel:    channel,
-		seen:       make(map[string]bool),
-		segments:   make([]SegmentInfo, 0),
+		sessionDir:  sessionDir,
+		channel:     channel,
+		seen:        make(map[string]bool),
+		segmentChan: make(chan SegmentInfo, 10000),
 	}
 }
 
 func NewSegmentDownloaderFromSession(sessionDir string) *SegmentDownloader {
 	sd := &SegmentDownloader{
-		sessionDir: sessionDir,
-		seen:       make(map[string]bool),
-		segments:   make([]SegmentInfo, 0),
+		sessionDir:  sessionDir,
+		seen:        make(map[string]bool),
+		segmentChan: make(chan SegmentInfo, 10000),
 	}
 
 	metadata, err := sd.LoadSessionMetadata()
@@ -116,63 +116,44 @@ func NewSegmentDownloaderFromSession(sessionDir string) *SegmentDownloader {
 
 func (sd *SegmentDownloader) AddSegment(url string, seqNum int) bool {
 	sd.mu.Lock()
-	defer sd.mu.Unlock()
-
 	if sd.seen[url] {
+		sd.mu.Unlock()
 		return false
 	}
-
 	sd.seen[url] = true
-	sd.segments = append(sd.segments, SegmentInfo{URL: url, SeqNum: seqNum})
+	sd.mu.Unlock()
+
+	sd.segmentChan <- SegmentInfo{URL: url, SeqNum: seqNum, RequeueCount: 0}
 	return true
 }
 
-func (sd *SegmentDownloader) DownloadQueuedSegments(ctx context.Context, concurrency int) {
-	sd.mu.Lock()
-	segments := make([]SegmentInfo, len(sd.segments))
-	copy(segments, sd.segments)
-	sd.segments = make([]SegmentInfo, 0)
-	batchSize := len(segments)
-	sd.mu.Unlock()
+func (sd *SegmentDownloader) StartWorkers(ctx context.Context, concurrency int) {
+	log.DebugfC(sd.channel, "Starting %d download workers", concurrency)
 
-	if batchSize == 0 {
-		return
-	}
-
-	log.DebugfC(sd.channel, "Downloading %d segments concurrently", batchSize)
-
-	var wg sync.WaitGroup
-	semaphore := make(chan struct{}, concurrency)
-	batchDownloaded := 0
-	batchMu := sync.Mutex{}
-
-	for _, seg := range segments {
-		select {
-		case <-ctx.Done():
-			return
-		default:
-		}
-
-		wg.Add(1)
-		semaphore <- struct{}{}
-
-		go func(segmentInfo SegmentInfo) {
-			defer wg.Done()
-			defer func() { <-semaphore }()
-
-			if err := sd.DownloadSegmentWithSeq(ctx, segmentInfo.URL, segmentInfo.SeqNum); err != nil {
-				log.ErrorfC(sd.channel, "Failed to download segment seq=%d: %v", segmentInfo.SeqNum, err)
-			} else {
-				batchMu.Lock()
-				batchDownloaded++
-				batchMu.Unlock()
+	for i := 0; i < concurrency; i++ {
+		go func(workerID int) {
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case seg := <-sd.segmentChan:
+					if err := sd.DownloadSegmentWithSeq(ctx, seg.URL, seg.SeqNum); err != nil {
+						if seg.RequeueCount >= 3 {
+							log.ErrorfC(sd.channel, "Segment seq=%d failed permanently after max requeues. Dropping.", seg.SeqNum)
+						} else {
+							log.WarnfC(sd.channel, "Failed to download segment seq=%d: %v. Re-queuing.", seg.SeqNum, err)
+							seg.RequeueCount++
+							go func(s SegmentInfo) {
+								select {
+								case sd.segmentChan <- s:
+								case <-ctx.Done():
+								}
+							}(seg)
+						}
+					}
+				}
 			}
-		}(seg)
-	}
-
-	wg.Wait()
-	if batchSize > 0 {
-		log.DebugfC(sd.channel, "Batch complete: downloaded %d/%d segments", batchDownloaded, batchSize)
+		}(i)
 	}
 }
 
@@ -273,12 +254,9 @@ func (sd *SegmentDownloader) downloadSegmentInternal(ctx context.Context, url st
 }
 
 func (sd *SegmentDownloader) sleepWithBackoff(attempt int) {
-	backoff := time.Duration(1<<uint(attempt)) * time.Second
-	if backoff > 8*time.Second {
-		backoff = 8 * time.Second
-	}
-	log.DebugfC(sd.channel, "Retrying in %v...", backoff)
-	time.Sleep(backoff)
+	const retryDelay = 1 * time.Second
+	log.DebugfC(sd.channel, "Retrying in %v...", retryDelay)
+	time.Sleep(retryDelay)
 }
 
 func (sd *SegmentDownloader) getSegmentFilenameWithNumber() (string, int) {
